@@ -1,29 +1,48 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #  Multi-Sensor-Gateway for ESP32 Payload (FastAPI Implementation)
-#  Receives, validates, and decodes environmental and methane sensor data.
+#  Receives, logs, and periodically uploads the most recent sensor data to Supabase.
 # ──────────────────────────────────────────────────────────────────────────────
 
+import os
+import json
+import asyncio
 from fastapi import FastAPI, Request
 from dataclasses import dataclass
 from typing import List, Dict, Any
-import uvicorn
+from datetime import datetime
+import logging
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Environment and Logging Setup
+# ──────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_TABLE = "sensor_data"
+SUPABASE_ENABLED = SUPABASE_URL and SUPABASE_KEY
+
+# Configure logging to file and console
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("sensor_payloads.log"),
+        logging.StreamHandler()
+    ]
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  INIR2 Methane Sensor Constants and Decoding Tables
 # ──────────────────────────────────────────────────────────────────────────────
-START_WORD = 0x0000005B     # Start marker '['
-END_WORD   = 0x0000005D     # End marker   ']'
+START_WORD = 0x0000005B
+END_WORD   = 0x0000005D
 MASK32     = 0xFFFFFFFF
 
 SUBSYS = [
-    "Gas Sensor",
-    "Power / Reset",
-    "ADC",
-    "DAC",
-    "UART",
-    "Timer / Counter",
-    "General",
-    "Memory"
+    "Gas Sensor", "Power / Reset", "ADC", "DAC", "UART",
+    "Timer / Counter", "General", "Memory"
 ]
 
 FAULT_TABLE = {
@@ -50,10 +69,6 @@ FAULT_TABLE = {
     7: {1: "Flash write failed",
         2: "Flash read failed"}
 }
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  CRC Calculation and Fault Decoding Functions
-# ──────────────────────────────────────────────────────────────────────────────
 
 def calc_crc(words: List[int]) -> int:
     """
@@ -90,10 +105,6 @@ def decode_faults(fault_word: int) -> List[str]:
         messages.append(f"{SUBSYS[idx]}: {text}")
     return messages or ["No errors detected"]
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Methane Sensor Data Structure
-# ──────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class MethaneSensorPacket:
     concentration_ppm: int
@@ -124,15 +135,11 @@ def parse_inir_payload(hex_words: List[str]) -> MethaneSensorPacket:
     """
     if len(hex_words) != 7:
         raise ValueError("Exactly seven 32-bit words are expected for the methane sensor frame.")
-
     words = [int(w, 16) for w in hex_words]
-
     if words[0] != START_WORD or words[-1] != END_WORD:
         raise ValueError("Start or end marker is invalid in the methane sensor frame.")
-
     if not validate_crc(words[:4], words[4], words[5]):
         raise ValueError("CRC validation failed for the methane sensor frame.")
-
     return MethaneSensorPacket(
         concentration_ppm=words[1],
         fault_word=words[2],
@@ -142,8 +149,12 @@ def parse_inir_payload(hex_words: List[str]) -> MethaneSensorPacket:
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  FastAPI Setup and Sensor Payload Processing
+#  FastAPI App, Data Buffer, and Upload Task
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Buffer for the latest received entry and last upload timestamp
+LAST_RECEIVED_ENTRY: Dict[str, Any] = {}
+LAST_UPLOAD_TIMESTAMP: str = ""
 
 app = FastAPI(
     title="ESP32 Multi-Sensor Gateway",
@@ -152,6 +163,12 @@ app = FastAPI(
         "including environmental sensors (pH, BME680, temperature) and INIR2 methane sensor."
     )
 )
+
+@app.on_event("startup")
+async def startup_event():
+    # Start background upload task
+    if SUPABASE_ENABLED:
+        asyncio.create_task(periodic_supabase_upload())
 
 @app.post("/data")
 async def receive_data(request: Request) -> Dict[str, Any]:
@@ -167,31 +184,22 @@ async def receive_data(request: Request) -> Dict[str, Any]:
         "bme_humidity": <float>,
         "bme_pressure": <float>,
         "bme_gas_resistance": <float>,
-        "methan_raw": [
-            "0000005b", "00000120", "aa1aaa1a", "00000b90",
-            "0000029f", "fffffd60", "0000005d"
-        ]
+        "methan_raw": ["0000005b", ... , "0000005d"]
     }
     """
-
     body = await request.json()
-    # 1. Temperature Filtering: Accept only values in [15, 50] °C
-    def filter_temperature(val: float) -> float:
-        """Returns NaN if the value is outside the plausible range, else the value."""
-        if 15.0 <= val <= 50.0:
-            return val
-        else:
-            return float("nan")
+
+    def filter_temperature(val):
+        return val if isinstance(val, (int, float)) and 15.0 <= val <= 50.0 else float("nan")
 
     temp1_raw = body.get("temp1")
     temp2_raw = body.get("temp2")
     temp1 = filter_temperature(temp1_raw)
     temp2 = filter_temperature(temp2_raw)
 
-    # 2. Parse Methane Sensor Frame if available and valid
+    methan_raw = body.get("methan_raw", [])
     methane_result = None
     methane_error = None
-    methan_raw = body.get("methan_raw", [])
     if isinstance(methan_raw, list) and len(methan_raw) == 7:
         try:
             packet = parse_inir_payload(methan_raw)
@@ -206,29 +214,9 @@ async def receive_data(request: Request) -> Dict[str, Any]:
     else:
         methane_error = "Methane raw payload missing or invalid format"
 
-    # 3. Print end results (for future DB loading)
-    print("\n📥  New Sensor Data Received")
-    print(f"   pH Value           : {body.get('ph')}")
-    print(f"   pH Voltage [mV]    : {body.get('ph_voltage')}")
-    print(f"   Temperature 1 [°C] : {temp1} (raw: {temp1_raw})")
-    print(f"   Temperature 2 [°C] : {temp2} (raw: {temp2_raw})")
-    print(f"   BME680 Temperature : {body.get('bme_temperature')}")
-    print(f"   BME680 Humidity    : {body.get('bme_humidity')}")
-    print(f"   BME680 Pressure    : {body.get('bme_pressure')}")
-    print(f"   BME680 GasResist   : {body.get('bme_gas_resistance')}")
-    print("   Methane Sensor Frame:")
-    print(f"      Raw: {methan_raw}")
-    if methane_result:
-        print(f"      Concentration   : {methane_result['concentration_ppm']} ppm")
-        print(f"      Percent Vol     : {methane_result['concentration_percent']} %")
-        print(f"      Temperature     : {methane_result['temperature_C']} °C")
-        for msg in methane_result['faults']:
-            print(f"         - {msg}")
-    else:
-        print(f"      Frame error     : {methane_error}")
-
-    return {
-        "status": "ok" if methane_result else "warning",
+    # Log entry (as JSON with UTC timestamp)
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
         "ph": body.get("ph"),
         "ph_voltage": body.get("ph_voltage"),
         "temp1": temp1,
@@ -237,13 +225,62 @@ async def receive_data(request: Request) -> Dict[str, Any]:
         "bme_humidity": body.get("bme_humidity"),
         "bme_pressure": body.get("bme_pressure"),
         "bme_gas_resistance": body.get("bme_gas_resistance"),
-        "methane_sensor": methane_result,
-        "methane_error": methane_error
+        "methan_raw": methan_raw,
+        "methane_ppm": methane_result["concentration_ppm"] if methane_result else None,
+        "methane_percent": methane_result["concentration_percent"] if methane_result else None,
+        "methane_temperature": methane_result["temperature_C"] if methane_result else None,
+        "methane_faults": methane_result["faults"] if methane_result else methane_error,
     }
+    # Write to log file
+    logging.info(json.dumps(log_entry, ensure_ascii=False))
+
+    # Print result in console
+    print("\n📥  New Sensor Data Received")
+    for key, val in log_entry.items():
+        print(f"   {key}: {val}")
+
+    # Save as the latest entry (for periodic upload)
+    global LAST_RECEIVED_ENTRY
+    LAST_RECEIVED_ENTRY = log_entry.copy()
+
+    return {
+        "status": "ok" if methane_result else "warning",
+        "message": methane_error if methane_error else "Valid data.",
+        **log_entry
+    }
+
+async def periodic_supabase_upload():
+    """
+    Periodically uploads the latest received sensor data to Supabase every 10 seconds,
+    only if the data is new (timestamp differs from last upload).
+    """
+    if not SUPABASE_ENABLED:
+        logging.warning("Supabase not configured. Data will not be uploaded.")
+        return
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    global LAST_RECEIVED_ENTRY, LAST_UPLOAD_TIMESTAMP
+    while True:
+        await asyncio.sleep(10)
+        if LAST_RECEIVED_ENTRY:
+            current_ts = LAST_RECEIVED_ENTRY.get("timestamp")
+            if current_ts and current_ts != LAST_UPLOAD_TIMESTAMP:
+                try:
+                    response = supabase.table(SUPABASE_TABLE).insert([LAST_RECEIVED_ENTRY]).execute()
+                    logging.info("Uploaded latest record to Supabase.")
+                    print("✅ Supabase upload successful: latest record.")
+                    LAST_UPLOAD_TIMESTAMP = current_ts
+                except Exception as e:
+                    logging.error(f"Supabase upload failed: {e}")
+                    print(f"❌ Supabase upload failed: {e}")
+            else:
+                logging.info("No new data to upload.")
+        else:
+            logging.info("No data received yet.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Stand-Alone Run / Development Entry Point
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
